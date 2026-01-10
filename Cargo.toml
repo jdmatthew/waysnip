@@ -1,0 +1,16 @@
+[package]
+name = "waysnip"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gtk4 = { version = "0.9", features = ["v4_12"] }
+libadwaita = { version = "0.7", features = ["v1_4"] }
+gtk4-layer-shell = "0.4"
+gdk-pixbuf = "0.20"
+glib = "0.20"
+chrono = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = true
