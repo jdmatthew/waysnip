@@ -29,9 +29,6 @@ impl std::error::Error for ScreenshotError {}
 
 /// Captured screenshot data
 pub struct Screenshot {
-    /// Raw PPM bytes (uncompressed, faster capture)
-    #[allow(dead_code)]
-    pub data: Vec<u8>,
     /// Loaded pixbuf for display
     pub pixbuf: Pixbuf,
     /// Screen width
@@ -66,10 +63,10 @@ impl Screenshot {
             return Err(ScreenshotError::CaptureFailure(stderr.to_string()));
         }
 
-        let data = output.stdout;
+        let ppm_data = output.stdout;
 
         // Load into pixbuf using a memory input stream
-        let bytes = glib::Bytes::from(&data);
+        let bytes = glib::Bytes::from(&ppm_data);
         let stream = gtk4::gio::MemoryInputStream::from_bytes(&bytes);
         let pixbuf = Pixbuf::from_stream(&stream, gtk4::gio::Cancellable::NONE)
             .map_err(|e| ScreenshotError::PixbufError(e.to_string()))?;
@@ -78,7 +75,6 @@ impl Screenshot {
         let height = pixbuf.height();
 
         Ok(Screenshot {
-            data,
             pixbuf,
             width,
             height,
