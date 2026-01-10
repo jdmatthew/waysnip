@@ -54,7 +54,7 @@ fn generate_screenshot_path() -> Option<PathBuf> {
 
 fn main() -> glib::ExitCode {
     // Create the application
-    let app = libadwaita::Application::builder()
+    let app = gtk4::Application::builder()
         .application_id(APP_ID)
         .flags(ApplicationFlags::FLAGS_NONE)
         .build();
@@ -64,7 +64,7 @@ fn main() -> glib::ExitCode {
     app.run()
 }
 
-fn build_ui(app: &libadwaita::Application) {
+fn build_ui(app: &gtk4::Application) {
     // First, capture the screenshot before showing any UI
     let screenshot = match screenshot::Screenshot::capture() {
         Ok(s) => s,
@@ -100,7 +100,7 @@ fn build_ui(app: &libadwaita::Application) {
 
     fixed.put(&canvas, 0.0, 0.0);
 
-    // Create button box with libadwaita style
+    // Create button box
     let button_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
     button_box.set_halign(gtk4::Align::Center);
     button_box.set_valign(gtk4::Align::Center);

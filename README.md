@@ -9,7 +9,6 @@ A simple screenshot selection tool for Wayland.
 ## Dependencies
 
 * GTK4
-* libadwaita
 * gtk4-layer-shell
 * grim
 * wl-clipboard
@@ -19,19 +18,19 @@ A simple screenshot selection tool for Wayland.
 **Arch Linux**
 
 ```sh
-pacman -S gtk4 libadwaita gtk4-layer-shell grim wl-clipboard
+pacman -S gtk4 gtk4-layer-shell grim wl-clipboard
 ```
 
 **Fedora**
 
 ```sh
-dnf install gtk4-devel libadwaita-devel gtk4-layer-shell-devel grim wl-clipboard
+dnf install gtk4-devel gtk4-layer-shell-devel grim wl-clipboard
 ```
 
 **Ubuntu / Debian**
 
 ```sh
-apt install libgtk-4-dev libadwaita-1-dev libgtk4-layer-shell-dev grim wl-clipboard
+apt install libgtk-4-dev libgtk4-layer-shell-dev grim wl-clipboard
 ```
 
 ## Build

@@ -29,7 +29,7 @@ impl std::error::Error for ScreenshotError {}
 
 /// Captured screenshot data
 pub struct Screenshot {
-    /// Raw PNG bytes (kept for potential future use)
+    /// Raw PPM bytes (uncompressed, faster capture)
     #[allow(dead_code)]
     pub data: Vec<u8>,
     /// Loaded pixbuf for display
@@ -53,9 +53,9 @@ impl Screenshot {
             return Err(ScreenshotError::GrimNotFound);
         }
 
-        // Execute grim to capture screenshot to stdout
+        // Execute grim to capture screenshot to stdout (using uncompressed PPM for speed)
         let output = Command::new("grim")
-            .args(["-t", "png", "-"])
+            .args(["-t", "ppm", "-"])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
