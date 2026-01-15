@@ -9,6 +9,7 @@ gtk4-layer-shell = "0.4"
 gdk-pixbuf = "0.20"
 glib = "0.20"
 chrono = "0.4"
+libwayshot = { version = "0.6", default-features = false }
 
 [profile.release]
 opt-level = 3

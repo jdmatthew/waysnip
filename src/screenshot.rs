@@ -1,26 +1,22 @@
-//! Screenshot capture functionality using grim
+//! Screenshot capture functionality using libwayshot (wlr-screencopy protocol)
 
-use gdk_pixbuf::Pixbuf;
-use std::process::{Command, Stdio};
+use gdk_pixbuf::{Colorspace, Pixbuf};
+use libwayshot::WayshotConnection;
 
 /// Error type for screenshot operations
 #[derive(Debug)]
 pub enum ScreenshotError {
-    GrimNotFound,
-    CaptureFailure(String),
+    WayshotError(String),
     PixbufError(String),
 }
 
 impl std::fmt::Display for ScreenshotError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ScreenshotError::GrimNotFound => {
-                write!(f, "grim command not found. Please install grim.")
+            ScreenshotError::WayshotError(msg) => {
+                write!(f, "Screenshot capture failed: {}", msg)
             }
-            ScreenshotError::CaptureFailure(msg) => {
-                write!(f, "Failed to capture screenshot: {}", msg)
-            }
-            ScreenshotError::PixbufError(msg) => write!(f, "Failed to load image: {}", msg),
+            ScreenshotError::PixbufError(msg) => write!(f, "Failed to create image: {}", msg),
         }
     }
 }
@@ -38,41 +34,33 @@ pub struct Screenshot {
 }
 
 impl Screenshot {
-    /// Capture a screenshot using grim
+    /// Capture a screenshot using wlr-screencopy protocol via libwayshot
     pub fn capture() -> Result<Self, ScreenshotError> {
-        // Check if grim is available
-        if Command::new("which")
-            .arg("grim")
-            .output()
-            .map(|o| !o.status.success())
-            .unwrap_or(true)
-        {
-            return Err(ScreenshotError::GrimNotFound);
-        }
+        // Connect to Wayland and capture screenshot
+        let wayshot =
+            WayshotConnection::new().map_err(|e| ScreenshotError::WayshotError(e.to_string()))?;
 
-        // Execute grim to capture screenshot to stdout (using uncompressed PPM for speed)
-        let output = Command::new("grim")
-            .args(["-t", "ppm", "-"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|e| ScreenshotError::CaptureFailure(e.to_string()))?;
+        // Capture all outputs (no cursor overlay)
+        let image = wayshot
+            .screenshot_all(false)
+            .map_err(|e| ScreenshotError::WayshotError(e.to_string()))?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(ScreenshotError::CaptureFailure(stderr.to_string()));
-        }
+        // Convert DynamicImage to RGBA8
+        let rgba_image = image.to_rgba8();
+        let width = rgba_image.width() as i32;
+        let height = rgba_image.height() as i32;
+        let pixels = rgba_image.into_raw();
 
-        let ppm_data = output.stdout;
-
-        // Load into pixbuf using a memory input stream
-        let bytes = glib::Bytes::from(&ppm_data);
-        let stream = gtk4::gio::MemoryInputStream::from_bytes(&bytes);
-        let pixbuf = Pixbuf::from_stream(&stream, gtk4::gio::Cancellable::NONE)
-            .map_err(|e| ScreenshotError::PixbufError(e.to_string()))?;
-
-        let width = pixbuf.width();
-        let height = pixbuf.height();
+        // Create Pixbuf from raw RGBA data
+        let pixbuf = Pixbuf::from_bytes(
+            &glib::Bytes::from(&pixels),
+            Colorspace::Rgb,
+            true, // has_alpha
+            8,    // bits_per_sample
+            width,
+            height,
+            width * 4, // rowstride (4 bytes per pixel: RGBA)
+        );
 
         Ok(Screenshot {
             pixbuf,
