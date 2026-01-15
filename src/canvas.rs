@@ -1,6 +1,6 @@
 //! Custom canvas widget for screenshot display and selection
 
-use crate::selection::Selection;
+use crate::selection::{DragMode, ResizeEdge, Selection};
 use gdk_pixbuf::Pixbuf;
 use gtk4::gdk;
 use gtk4::graphene;
@@ -10,25 +10,38 @@ use gtk4::subclass::prelude::*;
 use gtk4::{glib, EventControllerMotion, GestureDrag};
 use std::cell::{Cell, RefCell};
 
+/// Callback type for selection change notifications
+pub type SelectionChangeCallback = Box<dyn Fn(Option<(i32, i32, i32, i32)>)>;
+
 mod imp {
     use super::*;
 
     pub struct Canvas {
         pub texture: RefCell<Option<gdk::Texture>>,
+        pub pixbuf: RefCell<Option<Pixbuf>>,
         pub selection: RefCell<Selection>,
         pub screen_width: Cell<f32>,
         pub screen_height: Cell<f32>,
-        pub on_selection_change: RefCell<Option<Box<dyn Fn(Option<(i32, i32, i32, i32)>)>>>,
+        pub on_selection_change: RefCell<Option<SelectionChangeCallback>>,
+        /// Current cursor position
+        pub cursor_x: Cell<f32>,
+        pub cursor_y: Cell<f32>,
+        /// Whether cursor is currently over the widget
+        pub cursor_inside: Cell<bool>,
     }
 
     impl Default for Canvas {
         fn default() -> Self {
             Self {
                 texture: RefCell::new(None),
+                pixbuf: RefCell::new(None),
                 selection: RefCell::new(Selection::default()),
                 screen_width: Cell::new(0.0),
                 screen_height: Cell::new(0.0),
                 on_selection_change: RefCell::new(None),
+                cursor_x: Cell::new(0.0),
+                cursor_y: Cell::new(0.0),
+                cursor_inside: Cell::new(false),
             }
         }
     }
@@ -175,10 +188,61 @@ mod imp {
                         snapshot.pop();
                     }
                 }
+
+                // Draw crosshair and magnifier based on drag mode
+                if self.cursor_inside.get() {
+                    let cursor_x = self.cursor_x.get();
+                    let cursor_y = self.cursor_y.get();
+                    let drag_mode = selection.drag_mode;
+
+                    match drag_mode {
+                        DragMode::None => {
+                            // Check what would happen if user clicked here
+                            let hover_mode = selection.hit_test(cursor_x, cursor_y);
+
+                            // Only show crosshair/magnifier in dimmed area when not dragging
+                            // and not hovering over resize handles/edges
+                            if !sel_rect.contains(cursor_x, cursor_y) {
+                                match hover_mode {
+                                    DragMode::Creating => {
+                                        // Cursor is in dimmed area, show magnifier
+                                        self.draw_crosshair_and_magnifier(
+                                            snapshot, width, height, cursor_x, cursor_y, true,
+                                        );
+                                    }
+                                    _ => {
+                                        // Cursor is over resize handle/edge, don't show magnifier
+                                    }
+                                }
+                            }
+                        }
+                        DragMode::Creating | DragMode::Resizing(_) => {
+                            // Get the snap position based on what's being resized
+                            let snap_pos =
+                                self.get_snap_position(&sel_rect, drag_mode, cursor_x, cursor_y);
+                            self.draw_crosshair_and_magnifier(
+                                snapshot, width, height, snap_pos.0, snap_pos.1,
+                                true, // show crosshair
+                            );
+                        }
+                        DragMode::Moving => {
+                            // Don't show magnifier when moving
+                        }
+                    }
+                }
             } else {
                 // No selection yet - dim the entire screen
                 let full_rect = graphene::Rect::new(0.0, 0.0, width, height);
                 snapshot.append_color(&dim_color, &full_rect);
+
+                // Draw crosshair and magnifier when no selection exists
+                if self.cursor_inside.get() {
+                    let cursor_x = self.cursor_x.get();
+                    let cursor_y = self.cursor_y.get();
+                    self.draw_crosshair_and_magnifier(
+                        snapshot, width, height, cursor_x, cursor_y, true,
+                    );
+                }
             }
         }
 
@@ -189,6 +253,263 @@ mod imp {
                 _ => 0,
             };
             (size, size, -1, -1)
+        }
+    }
+
+    impl Canvas {
+        /// Get the snap position for the magnifier based on drag mode
+        /// Returns the position that should be centered in the magnifier
+        fn get_snap_position(
+            &self,
+            sel_rect: &crate::selection::Rect,
+            drag_mode: DragMode,
+            cursor_x: f32,
+            cursor_y: f32,
+        ) -> (f32, f32) {
+            match drag_mode {
+                DragMode::Creating => {
+                    // When creating, snap to the corner being dragged (opposite of start)
+                    // The cursor position is the active corner
+                    (cursor_x, cursor_y)
+                }
+                DragMode::Resizing(edge) => {
+                    // Snap to the edge/corner being resized
+                    match edge {
+                        ResizeEdge::TopLeft => (sel_rect.x, sel_rect.y),
+                        ResizeEdge::TopRight => (sel_rect.x + sel_rect.width, sel_rect.y),
+                        ResizeEdge::BottomRight => {
+                            (sel_rect.x + sel_rect.width, sel_rect.y + sel_rect.height)
+                        }
+                        ResizeEdge::BottomLeft => (sel_rect.x, sel_rect.y + sel_rect.height),
+                        ResizeEdge::Top => (cursor_x, sel_rect.y),
+                        ResizeEdge::Bottom => (cursor_x, sel_rect.y + sel_rect.height),
+                        ResizeEdge::Left => (sel_rect.x, cursor_y),
+                        ResizeEdge::Right => (sel_rect.x + sel_rect.width, cursor_y),
+                    }
+                }
+                _ => (cursor_x, cursor_y),
+            }
+        }
+
+        /// Draw crosshair lines and magnifier window
+        fn draw_crosshair_and_magnifier(
+            &self,
+            snapshot: &gtk4::Snapshot,
+            width: f32,
+            height: f32,
+            cursor_x: f32,
+            cursor_y: f32,
+            show_screen_crosshair: bool,
+        ) {
+            // Crosshair settings - dimmer at 0.8 opacity
+            let line_color = gdk::RGBA::new(1.0, 1.0, 1.0, 0.8);
+            let line_shadow_color = gdk::RGBA::new(0.0, 0.0, 0.0, 0.4);
+            let line_width = 1.0;
+
+            if show_screen_crosshair {
+                // Draw shadow lines first (offset by 1 pixel for shadow effect)
+                // Vertical line shadow
+                snapshot.append_color(
+                    &line_shadow_color,
+                    &graphene::Rect::new(cursor_x + 1.0, 0.0, line_width, height),
+                );
+                // Horizontal line shadow
+                snapshot.append_color(
+                    &line_shadow_color,
+                    &graphene::Rect::new(0.0, cursor_y + 1.0, width, line_width),
+                );
+
+                // Draw main crosshair lines
+                // Vertical line (full height)
+                snapshot.append_color(
+                    &line_color,
+                    &graphene::Rect::new(cursor_x, 0.0, line_width, height),
+                );
+                // Horizontal line (full width)
+                snapshot.append_color(
+                    &line_color,
+                    &graphene::Rect::new(0.0, cursor_y, width, line_width),
+                );
+            }
+
+            // Magnifier settings
+            let pixel_size = 8.0; // Size of each zoomed pixel
+            let pixels_x: i32 = 27; // Number of pixels horizontally (odd for center) - 1.8x bigger
+            let pixels_y: i32 = 19; // Number of pixels vertically (odd for center) - 1.8x bigger
+            let magnifier_width = pixel_size * pixels_x as f32;
+            let magnifier_height = pixel_size * pixels_y as f32;
+            let magnifier_margin = 20.0;
+            let corner_radius = 8.0;
+            let border_width = 2.0;
+
+            // Calculate magnifier position (bottom-right of cursor by default)
+            let mut mag_x = cursor_x + magnifier_margin;
+            let mut mag_y = cursor_y + magnifier_margin;
+
+            // Check for overflow and flip position if needed
+            let overflow_right = mag_x + magnifier_width > width;
+            let overflow_bottom = mag_y + magnifier_height > height;
+
+            if overflow_right {
+                mag_x = cursor_x - magnifier_margin - magnifier_width;
+            }
+            if overflow_bottom {
+                mag_y = cursor_y - magnifier_margin - magnifier_height;
+            }
+
+            // Ensure we stay within bounds
+            mag_x = mag_x.max(0.0).min(width - magnifier_width);
+            mag_y = mag_y.max(0.0).min(height - magnifier_height);
+
+            // Draw magnifier background/border
+            let outer_rect = graphene::Rect::new(
+                mag_x - border_width,
+                mag_y - border_width,
+                magnifier_width + border_width * 2.0,
+                magnifier_height + border_width * 2.0,
+            );
+            let outer_rounded =
+                gsk::RoundedRect::from_rect(outer_rect, corner_radius + border_width);
+            let border_color = gdk::RGBA::new(1.0, 1.0, 1.0, 1.0);
+            snapshot.push_rounded_clip(&outer_rounded);
+            snapshot.append_color(&border_color, &outer_rect);
+            snapshot.pop();
+
+            // Draw magnified content with pixel grid
+            let inner_rect = graphene::Rect::new(mag_x, mag_y, magnifier_width, magnifier_height);
+            let inner_rounded = gsk::RoundedRect::from_rect(inner_rect, corner_radius);
+            snapshot.push_rounded_clip(&inner_rounded);
+
+            // Draw black background first
+            let bg_color = gdk::RGBA::new(0.0, 0.0, 0.0, 1.0);
+            snapshot.append_color(&bg_color, &inner_rect);
+
+            // Draw pixels from pixbuf directly
+            if let Some(ref pixbuf) = *self.pixbuf.borrow() {
+                let pb_width = pixbuf.width();
+                let pb_height = pixbuf.height();
+                let n_channels = pixbuf.n_channels() as usize;
+                let rowstride = pixbuf.rowstride() as usize;
+                let pixels = unsafe { pixbuf.pixels() };
+
+                // Center pixel position in source image
+                let center_px = cursor_x.floor() as i32;
+                let center_py = cursor_y.floor() as i32;
+
+                // Draw each pixel as a rectangle
+                for py in 0..pixels_y {
+                    for px in 0..pixels_x {
+                        // Source pixel coordinates (centered on cursor)
+                        let src_x = center_px - (pixels_x / 2) + px;
+                        let src_y = center_py - (pixels_y / 2) + py;
+
+                        // Skip if out of bounds
+                        if src_x < 0 || src_x >= pb_width || src_y < 0 || src_y >= pb_height {
+                            continue;
+                        }
+
+                        // Get pixel color from pixbuf
+                        let offset = src_y as usize * rowstride + src_x as usize * n_channels;
+                        let r = pixels[offset] as f32 / 255.0;
+                        let g = pixels[offset + 1] as f32 / 255.0;
+                        let b = pixels[offset + 2] as f32 / 255.0;
+
+                        let pixel_color = gdk::RGBA::new(r, g, b, 1.0);
+
+                        // Draw pixel rectangle
+                        let rect_x = mag_x + px as f32 * pixel_size;
+                        let rect_y = mag_y + py as f32 * pixel_size;
+                        let pixel_rect =
+                            graphene::Rect::new(rect_x, rect_y, pixel_size, pixel_size);
+                        snapshot.append_color(&pixel_color, &pixel_rect);
+                    }
+                }
+
+                // Draw pixel grid lines
+                let grid_color = gdk::RGBA::new(0.3, 0.3, 0.3, 0.5);
+                let grid_line_width = 1.0;
+
+                // Vertical grid lines
+                for i in 1..pixels_x {
+                    let x = mag_x + i as f32 * pixel_size;
+                    let grid_rect =
+                        graphene::Rect::new(x, mag_y, grid_line_width, magnifier_height);
+                    snapshot.append_color(&grid_color, &grid_rect);
+                }
+
+                // Horizontal grid lines
+                for i in 1..pixels_y {
+                    let y = mag_y + i as f32 * pixel_size;
+                    let grid_rect = graphene::Rect::new(mag_x, y, magnifier_width, grid_line_width);
+                    snapshot.append_color(&grid_color, &grid_rect);
+                }
+            }
+
+            // Draw crosshair lines through center of magnifier (one grid block thick)
+            let crosshair_color = gdk::RGBA::new(1.0, 0.2, 0.2, 0.5);
+            let center_px_idx_x = pixels_x / 2;
+            let center_px_idx_y = pixels_y / 2;
+
+            // Vertical crosshair line (full height of magnifier, one pixel_size wide)
+            snapshot.append_color(
+                &crosshair_color,
+                &graphene::Rect::new(
+                    mag_x + center_px_idx_x as f32 * pixel_size,
+                    mag_y,
+                    pixel_size,
+                    magnifier_height,
+                ),
+            );
+            // Horizontal crosshair line (full width of magnifier, one pixel_size tall)
+            snapshot.append_color(
+                &crosshair_color,
+                &graphene::Rect::new(
+                    mag_x,
+                    mag_y + center_px_idx_y as f32 * pixel_size,
+                    magnifier_width,
+                    pixel_size,
+                ),
+            );
+
+            snapshot.pop();
+
+            // Draw border highlight around center pixel
+            let center_px_x = mag_x + (pixels_x / 2) as f32 * pixel_size;
+            let center_px_y = mag_y + (pixels_y / 2) as f32 * pixel_size;
+            let indicator_color = gdk::RGBA::new(1.0, 1.0, 1.0, 0.9);
+            let indicator_width = 1.5;
+
+            // Draw border around center pixel
+            // Top border
+            snapshot.append_color(
+                &indicator_color,
+                &graphene::Rect::new(center_px_x, center_px_y, pixel_size, indicator_width),
+            );
+            // Bottom border
+            snapshot.append_color(
+                &indicator_color,
+                &graphene::Rect::new(
+                    center_px_x,
+                    center_px_y + pixel_size - indicator_width,
+                    pixel_size,
+                    indicator_width,
+                ),
+            );
+            // Left border
+            snapshot.append_color(
+                &indicator_color,
+                &graphene::Rect::new(center_px_x, center_px_y, indicator_width, pixel_size),
+            );
+            // Right border
+            snapshot.append_color(
+                &indicator_color,
+                &graphene::Rect::new(
+                    center_px_x + pixel_size - indicator_width,
+                    center_px_y,
+                    indicator_width,
+                    pixel_size,
+                ),
+            );
         }
     }
 }
@@ -209,8 +530,12 @@ impl Canvas {
         let width = pixbuf.width() as f32;
         let height = pixbuf.height() as f32;
 
-        // Create texture from pixbuf
-        let texture = gdk::Texture::for_pixbuf(pixbuf);
+        // Store the pixbuf for magnifier use
+        *imp.pixbuf.borrow_mut() = Some(pixbuf.clone());
+
+        // Create texture from a new copy of pixbuf to avoid memory overlap issues
+        let pixbuf_copy = pixbuf.copy().expect("Failed to copy pixbuf");
+        let texture = gdk::Texture::for_pixbuf(&pixbuf_copy);
         *imp.texture.borrow_mut() = Some(texture);
 
         // Update dimensions
@@ -290,17 +615,68 @@ impl Canvas {
         let canvas_weak = self.downgrade();
         motion.connect_motion(move |_, x, y| {
             if let Some(canvas) = canvas_weak.upgrade() {
-                let selection = canvas.imp().selection.borrow();
+                let imp = canvas.imp();
+
+                // Update cursor position
+                imp.cursor_x.set(x as f32);
+                imp.cursor_y.set(y as f32);
+
+                let selection = imp.selection.borrow();
                 let cursor_name = selection.cursor_for_position(x as f32, y as f32);
                 drop(selection);
 
                 if let Some(cursor) = gdk::Cursor::from_name(cursor_name, None) {
                     canvas.set_cursor(Some(&cursor));
                 }
+
+                // Always redraw when cursor moves to update crosshair/magnifier
+                canvas.queue_draw();
+            }
+        });
+
+        // Track when cursor enters/leaves the widget
+        let canvas_weak = self.downgrade();
+        motion.connect_enter(move |_, x, y| {
+            if let Some(canvas) = canvas_weak.upgrade() {
+                let imp = canvas.imp();
+                imp.cursor_inside.set(true);
+                imp.cursor_x.set(x as f32);
+                imp.cursor_y.set(y as f32);
+                canvas.queue_draw();
+            }
+        });
+
+        let canvas_weak = self.downgrade();
+        motion.connect_leave(move |_| {
+            if let Some(canvas) = canvas_weak.upgrade() {
+                canvas.imp().cursor_inside.set(false);
+                canvas.queue_draw();
             }
         });
 
         self.add_controller(motion);
+
+        // Set cursor_inside to true initially since the window covers the whole screen
+        // and cursor is always "inside" when the app launches
+        self.imp().cursor_inside.set(true);
+
+        // Query initial cursor position after the widget is realized
+        let canvas_weak = self.downgrade();
+        self.connect_realize(move |_| {
+            if let Some(canvas) = canvas_weak.upgrade() {
+                // Get the pointer position from the display's default seat
+                let display = canvas.display();
+                if let Some(seat) = display.default_seat() {
+                    if let Some(pointer) = seat.pointer() {
+                        let (_, x, y) = pointer.surface_at_position();
+                        let imp = canvas.imp();
+                        imp.cursor_x.set(x as f32);
+                        imp.cursor_y.set(y as f32);
+                        canvas.queue_draw();
+                    }
+                }
+            }
+        });
     }
 
     /// Check if there's a valid selection
