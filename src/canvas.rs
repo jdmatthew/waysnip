@@ -1,6 +1,6 @@
 //! Custom canvas widget for screenshot display and selection
 
-use crate::selection::{DragMode, ResizeEdge, Selection};
+use crate::selection::{DragMode, Rect, ResizeEdge, Selection};
 use gdk_pixbuf::Pixbuf;
 use gtk4::gdk;
 use gtk4::graphene;
@@ -9,6 +9,7 @@ use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
 use gtk4::{glib, EventControllerMotion, GestureDrag};
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 
 /// Callback type for selection change notifications
 pub type SelectionChangeCallback = Box<dyn Fn(Option<(i32, i32, i32, i32)>)>;
@@ -28,6 +29,10 @@ mod imp {
         pub cursor_y: Cell<f32>,
         /// Whether cursor is currently over the widget
         pub cursor_inside: Cell<bool>,
+        /// Cached cursor objects
+        pub cursors: RefCell<HashMap<&'static str, gdk::Cursor>>,
+        /// Current cursor name (to avoid unnecessary updates)
+        pub current_cursor: RefCell<&'static str>,
     }
 
     impl Default for Canvas {
@@ -42,6 +47,8 @@ mod imp {
                 cursor_x: Cell::new(0.0),
                 cursor_y: Cell::new(0.0),
                 cursor_inside: Cell::new(false),
+                cursors: RefCell::new(HashMap::new()),
+                current_cursor: RefCell::new("default"),
             }
         }
     }
@@ -79,6 +86,11 @@ mod imp {
 
             // Draw dimming overlay with selection cutout
             let selection = self.selection.borrow();
+
+            // Get predefined regions info for drawing
+            let hovered_region = selection.hovered_region;
+            let predefined_regions = selection.predefined_regions.clone();
+
             if let Some(sel_rect) = selection.rect {
                 let sel_rect = sel_rect.normalized();
 
@@ -235,6 +247,9 @@ mod imp {
                 let full_rect = graphene::Rect::new(0.0, 0.0, width, height);
                 snapshot.append_color(&dim_color, &full_rect);
 
+                // Draw predefined regions as clickable areas
+                self.draw_predefined_regions(snapshot, &predefined_regions, hovered_region);
+
                 // Draw crosshair and magnifier when no selection exists
                 if self.cursor_inside.get() {
                     let cursor_x = self.cursor_x.get();
@@ -384,44 +399,50 @@ mod imp {
             let bg_color = gdk::RGBA::new(0.0, 0.0, 0.0, 1.0);
             snapshot.append_color(&bg_color, &inner_rect);
 
-            // Draw pixels from pixbuf directly
+            // Draw pixels from pixbuf using nearest-neighbor scaling
             if let Some(ref pixbuf) = *self.pixbuf.borrow() {
                 let pb_width = pixbuf.width();
                 let pb_height = pixbuf.height();
-                let n_channels = pixbuf.n_channels() as usize;
-                let rowstride = pixbuf.rowstride() as usize;
-                let pixels = unsafe { pixbuf.pixels() };
 
                 // Center pixel position in source image
                 let center_px = cursor_x.floor() as i32;
                 let center_py = cursor_y.floor() as i32;
 
-                // Draw each pixel as a rectangle
-                for py in 0..pixels_y {
-                    for px in 0..pixels_x {
-                        // Source pixel coordinates (centered on cursor)
-                        let src_x = center_px - (pixels_x / 2) + px;
-                        let src_y = center_py - (pixels_y / 2) + py;
+                // Calculate source region bounds
+                let src_x = center_px - (pixels_x / 2);
+                let src_y = center_py - (pixels_y / 2);
 
-                        // Skip if out of bounds
-                        if src_x < 0 || src_x >= pb_width || src_y < 0 || src_y >= pb_height {
-                            continue;
-                        }
+                // Clamp to valid pixbuf bounds
+                let valid_src_x = src_x.max(0);
+                let valid_src_y = src_y.max(0);
+                let valid_end_x = (src_x + pixels_x).min(pb_width);
+                let valid_end_y = (src_y + pixels_y).min(pb_height);
+                let valid_width = (valid_end_x - valid_src_x).max(0);
+                let valid_height = (valid_end_y - valid_src_y).max(0);
 
-                        // Get pixel color from pixbuf
-                        let offset = src_y as usize * rowstride + src_x as usize * n_channels;
-                        let r = pixels[offset] as f32 / 255.0;
-                        let g = pixels[offset + 1] as f32 / 255.0;
-                        let b = pixels[offset + 2] as f32 / 255.0;
+                if valid_width > 0 && valid_height > 0 {
+                    // Extract sub-region and scale with nearest-neighbor
+                    let sub_pixbuf =
+                        pixbuf.new_subpixbuf(valid_src_x, valid_src_y, valid_width, valid_height);
 
-                        let pixel_color = gdk::RGBA::new(r, g, b, 1.0);
+                    let scale = pixel_size as i32;
+                    if let Some(scaled) = sub_pixbuf.scale_simple(
+                        valid_width * scale,
+                        valid_height * scale,
+                        gdk_pixbuf::InterpType::Nearest,
+                    ) {
+                        // Calculate offset for partial regions (when cursor is near edges)
+                        let offset_x = (valid_src_x - src_x) as f32 * pixel_size;
+                        let offset_y = (valid_src_y - src_y) as f32 * pixel_size;
 
-                        // Draw pixel rectangle
-                        let rect_x = mag_x + px as f32 * pixel_size;
-                        let rect_y = mag_y + py as f32 * pixel_size;
-                        let pixel_rect =
-                            graphene::Rect::new(rect_x, rect_y, pixel_size, pixel_size);
-                        snapshot.append_color(&pixel_color, &pixel_rect);
+                        let texture = gdk::Texture::for_pixbuf(&scaled);
+                        let texture_rect = graphene::Rect::new(
+                            mag_x + offset_x,
+                            mag_y + offset_y,
+                            (valid_width * scale) as f32,
+                            (valid_height * scale) as f32,
+                        );
+                        snapshot.append_texture(&texture, &texture_rect);
                     }
                 }
 
@@ -511,6 +532,72 @@ mod imp {
                 ),
             );
         }
+
+        /// Draw predefined regions as clickable/highlightable areas
+        fn draw_predefined_regions(
+            &self,
+            snapshot: &gtk4::Snapshot,
+            regions: &[Rect],
+            hovered_region: Option<usize>,
+        ) {
+            if regions.is_empty() {
+                return;
+            }
+
+            // Colors for predefined regions
+            let normal_border_color = gdk::RGBA::new(1.0, 1.0, 1.0, 0.5);
+            let hover_border_color = gdk::RGBA::new(1.0, 1.0, 1.0, 1.0);
+            let hover_fill_color = gdk::RGBA::new(1.0, 1.0, 1.0, 0.15);
+            let border_width = 2.0;
+
+            for (i, region) in regions.iter().enumerate() {
+                let is_hovered = hovered_region == Some(i);
+                let border_color = if is_hovered {
+                    &hover_border_color
+                } else {
+                    &normal_border_color
+                };
+
+                // Draw hover fill if this region is hovered
+                if is_hovered {
+                    let fill_rect =
+                        graphene::Rect::new(region.x, region.y, region.width, region.height);
+                    snapshot.append_color(&hover_fill_color, &fill_rect);
+                }
+
+                // Draw border
+                // Top border
+                snapshot.append_color(
+                    border_color,
+                    &graphene::Rect::new(region.x, region.y, region.width, border_width),
+                );
+                // Bottom border
+                snapshot.append_color(
+                    border_color,
+                    &graphene::Rect::new(
+                        region.x,
+                        region.y + region.height - border_width,
+                        region.width,
+                        border_width,
+                    ),
+                );
+                // Left border
+                snapshot.append_color(
+                    border_color,
+                    &graphene::Rect::new(region.x, region.y, border_width, region.height),
+                );
+                // Right border
+                snapshot.append_color(
+                    border_color,
+                    &graphene::Rect::new(
+                        region.x + region.width - border_width,
+                        region.y,
+                        border_width,
+                        region.height,
+                    ),
+                );
+            }
+        }
     }
 }
 
@@ -548,6 +635,12 @@ impl Canvas {
         self.queue_draw();
     }
 
+    /// Set predefined regions for quick selection
+    pub fn set_predefined_regions(&self, regions: Vec<Rect>) {
+        let mut selection = self.imp().selection.borrow_mut();
+        selection.predefined_regions = regions;
+    }
+
     /// Set callback for selection changes
     pub fn set_on_selection_change<F: Fn(Option<(i32, i32, i32, i32)>) + 'static>(
         &self,
@@ -565,8 +658,54 @@ impl Canvas {
         }
     }
 
+    /// Initialize cached cursors
+    fn init_cursors(&self) {
+        let imp = self.imp();
+        let mut cursors = imp.cursors.borrow_mut();
+
+        let cursor_names = [
+            "default",
+            "crosshair",
+            "pointer",
+            "grab",
+            "grabbing",
+            "nw-resize",
+            "ne-resize",
+            "sw-resize",
+            "se-resize",
+            "n-resize",
+            "s-resize",
+            "e-resize",
+            "w-resize",
+        ];
+
+        for name in cursor_names {
+            if let Some(cursor) = gdk::Cursor::from_name(name, None) {
+                cursors.insert(name, cursor);
+            }
+        }
+    }
+
+    /// Set cursor by name (uses cache, only updates if changed)
+    fn set_cursor_by_name(&self, name: &'static str) {
+        let imp = self.imp();
+
+        // Only update if cursor changed
+        if *imp.current_cursor.borrow() == name {
+            return;
+        }
+
+        *imp.current_cursor.borrow_mut() = name;
+
+        if let Some(cursor) = imp.cursors.borrow().get(name) {
+            self.set_cursor(Some(cursor));
+        }
+    }
+
     /// Setup gesture and motion controllers
     pub fn setup_controllers(&self) {
+        // Initialize cursor cache
+        self.init_cursors();
         // Drag gesture for selection
         let drag = GestureDrag::new();
         drag.set_button(gdk::BUTTON_PRIMARY);
@@ -575,8 +714,23 @@ impl Canvas {
         drag.connect_drag_begin(move |_, x, y| {
             if let Some(canvas) = canvas_weak.upgrade() {
                 let mut selection = canvas.imp().selection.borrow_mut();
+
+                // If no selection exists and clicking on a predefined region, select it
+                if selection.rect.is_none() {
+                    if let Some(index) = selection.find_predefined_region_at(x as f32, y as f32) {
+                        selection.select_predefined_region(index);
+                        drop(selection);
+                        canvas.queue_draw();
+                        canvas.notify_selection_change();
+                        return;
+                    }
+                }
+
                 selection.start_drag(x as f32, y as f32);
+                let cursor_name = selection.cursor_for_position(x as f32, y as f32);
                 drop(selection);
+
+                canvas.set_cursor_by_name(cursor_name);
                 canvas.queue_draw();
                 canvas.notify_selection_change();
             }
@@ -598,11 +752,17 @@ impl Canvas {
         });
 
         let canvas_weak = self.downgrade();
-        drag.connect_drag_end(move |_, _, _| {
+        drag.connect_drag_end(move |gesture, _, _| {
             if let Some(canvas) = canvas_weak.upgrade() {
                 let mut selection = canvas.imp().selection.borrow_mut();
                 selection.end_drag();
+
+                // Get cursor position to update cursor after drag ends
+                let (x, y) = gesture.start_point().unwrap_or((0.0, 0.0));
+                let cursor_name = selection.cursor_for_position(x as f32, y as f32);
                 drop(selection);
+
+                canvas.set_cursor_by_name(cursor_name);
                 canvas.queue_draw();
                 canvas.notify_selection_change();
             }
@@ -621,13 +781,24 @@ impl Canvas {
                 imp.cursor_x.set(x as f32);
                 imp.cursor_y.set(y as f32);
 
+                // Update hovered predefined region
+                {
+                    let mut selection = imp.selection.borrow_mut();
+                    selection.update_hovered_region(x as f32, y as f32);
+                }
+
                 let selection = imp.selection.borrow();
-                let cursor_name = selection.cursor_for_position(x as f32, y as f32);
+
+                // Use pointer cursor when hovering over a predefined region
+                let cursor_name = if selection.hovered_region.is_some() && selection.rect.is_none()
+                {
+                    "pointer"
+                } else {
+                    selection.cursor_for_position(x as f32, y as f32)
+                };
                 drop(selection);
 
-                if let Some(cursor) = gdk::Cursor::from_name(cursor_name, None) {
-                    canvas.set_cursor(Some(&cursor));
-                }
+                canvas.set_cursor_by_name(cursor_name);
 
                 // Always redraw when cursor moves to update crosshair/magnifier
                 canvas.queue_draw();

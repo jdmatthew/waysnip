@@ -1,5 +1,7 @@
 //! Selection box logic for handling drag, resize, and move operations
 
+use std::io::{self, BufRead, IsTerminal};
+
 /// Size of resize handles in pixels
 pub const HANDLE_SIZE: f32 = 14.0;
 
@@ -68,6 +70,48 @@ impl Rect {
             y,
             width,
             height,
+        }
+    }
+
+    /// Parse a rect from format: "x1,y1 x2,y2"
+    /// where x1,y1 is the top-left corner and x2,y2 is the bottom-right corner
+    /// Example: "100,200 900,800" creates a rect at (100,200) with size 800x600
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+        let parts: Vec<&str> = s.split_whitespace().collect();
+        if parts.len() != 2 {
+            return None;
+        }
+
+        // Parse "x1,y1"
+        let p1: Vec<&str> = parts[0].split(',').collect();
+        if p1.len() != 2 {
+            return None;
+        }
+        let x1: f32 = p1[0].parse().ok()?;
+        let y1: f32 = p1[1].parse().ok()?;
+
+        // Parse "x2,y2"
+        let p2: Vec<&str> = parts[1].split(',').collect();
+        if p2.len() != 2 {
+            return None;
+        }
+        let x2: f32 = p2[0].parse().ok()?;
+        let y2: f32 = p2[1].parse().ok()?;
+
+        // Calculate width and height from corner coordinates
+        let width = x2 - x1;
+        let height = y2 - y1;
+
+        if width > 0.0 && height > 0.0 {
+            Some(Self {
+                x: x1,
+                y: y1,
+                width,
+                height,
+            })
+        } else {
+            None
         }
     }
 
@@ -150,6 +194,10 @@ pub struct Selection {
     pub drag_start: (f32, f32),
     /// Original rect when drag started
     pub drag_start_rect: Option<Rect>,
+    /// Predefined regions from stdin for quick selection
+    pub predefined_regions: Vec<Rect>,
+    /// Index of currently hovered predefined region
+    pub hovered_region: Option<usize>,
 }
 
 impl Selection {
@@ -161,6 +209,51 @@ impl Selection {
             drag_mode: DragMode::None,
             drag_start: (0.0, 0.0),
             drag_start_rect: None,
+            predefined_regions: Vec::new(),
+            hovered_region: None,
+        }
+    }
+
+    /// Create a new selection with predefined regions
+    pub fn with_predefined_regions(
+        screen_width: f32,
+        screen_height: f32,
+        predefined_regions: Vec<Rect>,
+    ) -> Self {
+        Self {
+            rect: None,
+            screen_width,
+            screen_height,
+            drag_mode: DragMode::None,
+            drag_start: (0.0, 0.0),
+            drag_start_rect: None,
+            predefined_regions,
+            hovered_region: None,
+        }
+    }
+
+    /// Find which predefined region (if any) contains the given point
+    pub fn find_predefined_region_at(&self, x: f32, y: f32) -> Option<usize> {
+        for (i, region) in self.predefined_regions.iter().enumerate() {
+            if region.contains(x, y) {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Update hovered region based on cursor position
+    pub fn update_hovered_region(&mut self, x: f32, y: f32) {
+        self.hovered_region = self.find_predefined_region_at(x, y);
+    }
+
+    /// Select a predefined region by index
+    pub fn select_predefined_region(&mut self, index: usize) -> bool {
+        if let Some(region) = self.predefined_regions.get(index) {
+            self.rect = Some(*region);
+            true
+        } else {
+            false
         }
     }
 
@@ -256,6 +349,11 @@ impl Selection {
 
     /// Get cursor name for the given position
     pub fn cursor_for_position(&self, x: f32, y: f32) -> &'static str {
+        // If actively dragging to move, show grabbing cursor
+        if self.drag_mode == DragMode::Moving {
+            return "grabbing";
+        }
+
         // Check corners first
         if let Some(edge) = self.hit_test_corner(x, y) {
             return edge.cursor_name();
@@ -266,10 +364,10 @@ impl Selection {
             return edge.cursor_name();
         }
 
-        // Check if inside selection
+        // Check if inside selection (hovering, not dragging)
         if let Some(ref rect) = self.rect {
             if rect.normalized().contains(x, y) {
-                return "move";
+                return "grab";
             }
         }
 
@@ -397,4 +495,26 @@ impl Selection {
             false
         }
     }
+}
+
+/// Read predefined regions from stdin if stdin is not a terminal.
+/// Format: one region per line, in slurp format "x,y WxH"
+/// Example: "100,200 800x600"
+pub fn read_predefined_regions_from_stdin() -> Vec<Rect> {
+    let stdin = io::stdin();
+
+    // Only read if stdin is not a terminal (i.e., piped input)
+    if stdin.is_terminal() {
+        return Vec::new();
+    }
+
+    let mut regions = Vec::new();
+    for line in stdin.lock().lines() {
+        if let Ok(line) = line {
+            if let Some(rect) = Rect::parse(&line) {
+                regions.push(rect);
+            }
+        }
+    }
+    regions
 }

@@ -12,6 +12,7 @@ use gtk4::gio::ApplicationFlags;
 use gtk4::glib;
 use gtk4::prelude::*;
 use screenshot::Screenshot;
+use selection::read_predefined_regions_from_stdin;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -82,13 +83,28 @@ fn save_selection_to_file(canvas: &Canvas, screenshot: &Screenshot) -> Screensho
 }
 
 fn main() -> glib::ExitCode {
+    // Read predefined regions from stdin BEFORE GTK takes over
+    // This must happen early because GTK may interfere with stdin
+    let predefined_regions = read_predefined_regions_from_stdin();
+
+    // Store in a thread-local for the GTK callback to access
+    thread_local! {
+        static PREDEFINED_REGIONS: RefCell<Vec<selection::Rect>> = RefCell::new(Vec::new());
+    }
+    PREDEFINED_REGIONS.with(|r| {
+        *r.borrow_mut() = predefined_regions;
+    });
+
     // Create the application
     let app = gtk4::Application::builder()
         .application_id(APP_ID)
         .flags(ApplicationFlags::FLAGS_NONE)
         .build();
 
-    app.connect_activate(build_ui);
+    app.connect_activate(move |app| {
+        let regions = PREDEFINED_REGIONS.with(|r| r.borrow().clone());
+        build_ui(app, regions);
+    });
 
     app.run()
 }
@@ -387,7 +403,7 @@ fn connect_button_handlers(
     });
 }
 
-fn build_ui(app: &gtk4::Application) {
+fn build_ui(app: &gtk4::Application, predefined_regions: Vec<selection::Rect>) {
     // Force Adwaita icon theme via GTK settings
     let settings = gtk4::Settings::default().expect("Could not get default settings");
     settings.set_gtk_icon_theme_name(Some("Adwaita"));
@@ -422,6 +438,12 @@ fn build_ui(app: &gtk4::Application) {
     // Create canvas and set the screenshot
     let canvas = Canvas::new();
     canvas.set_pixbuf(&screenshot.pixbuf);
+
+    // Set predefined regions if any were provided via stdin
+    if !predefined_regions.is_empty() {
+        canvas.set_predefined_regions(predefined_regions);
+    }
+
     canvas.setup_controllers();
     canvas.set_size_request(screen_width, screen_height);
     fixed.put(&canvas, 0.0, 0.0);
