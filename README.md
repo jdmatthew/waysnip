@@ -1,3 +1,6 @@
+> [!NOTE]  
+> Discontinued since I don't use Linux anymore.
+
 # Waysnip
 
 A simple screenshot selection tool for Wayland.
